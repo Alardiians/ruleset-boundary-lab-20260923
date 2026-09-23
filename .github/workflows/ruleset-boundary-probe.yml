@@ -1,0 +1,74 @@
+name: Owned branch ruleset workflow token probe
+on:
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Compare protected and unprotected writes
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 - <<'PY'
+          import base64, json, os, urllib.error, urllib.parse, urllib.request
+
+          root = 'https://api.github.com/repos/Alardiians/ruleset-boundary-lab-20260923'
+          branch = 'probe-unprotected-20260923'
+          marker = b'RULESET_CONTROL_20260923\n'
+          headers = {
+              'Authorization': 'Bearer ' + os.environ['GH_TOKEN'],
+              'Accept': 'application/vnd.github+json',
+              'X-GitHub-Api-Version': '2022-11-28',
+              'User-Agent': 'owned-ruleset-boundary-probe',
+          }
+
+          def api(label, method, path, payload=None):
+              data = json.dumps(payload).encode() if payload is not None else None
+              request = urllib.request.Request(root + path, data=data, method=method, headers={**headers, **({'Content-Type': 'application/json'} if data is not None else {})})
+              try:
+                  response = urllib.request.urlopen(request, timeout=20)
+              except urllib.error.HTTPError as error:
+                  response = error
+              with response:
+                  raw = response.read()
+                  try:
+                      doc = json.loads(raw)
+                  except ValueError:
+                      doc = {}
+                  message = doc.get('message') if isinstance(doc, dict) else None
+                  result = {'label': label, 'status': response.status, 'message': message[:220] if isinstance(message, str) else None}
+                  if isinstance(doc, dict) and isinstance(doc.get('content'), dict):
+                      result['content_sha'] = doc['content'].get('sha')
+                  if isinstance(doc, dict) and isinstance(doc.get('commit'), dict):
+                      result['commit_sha'] = doc['commit'].get('sha')
+                  print('RULESET_PROBE ' + json.dumps(result, sort_keys=True))
+                  return result, doc
+
+          rules, rule_doc = api('ruleset_list', 'GET', '/rulesets?includes_parents=false')
+          print('RULESET_PROBE_RULES ' + json.dumps([{'id': r.get('id'), 'name': r.get('name'), 'enforcement': r.get('enforcement')} for r in rule_doc] if isinstance(rule_doc, list) else []))
+
+          main_ref, main_doc = api('main_ref_before', 'GET', '/git/ref/heads/main')
+          assert main_ref['status'] == 200
+          main_sha = main_doc['object']['sha']
+          print('RULESET_PROBE main_sha_before=' + main_sha)
+
+          created, _ = api('create_unprotected_branch', 'POST', '/git/refs', {'ref': 'refs/heads/' + branch, 'sha': main_sha})
+          assert created['status'] == 201
+          control_payload = {'message': 'Add synthetic unprotected-branch control', 'content': base64.b64encode(marker).decode(), 'branch': branch}
+          control, control_doc = api('unprotected_content_write', 'PUT', '/contents/probe-unprotected.txt', control_payload)
+          assert control['status'] == 201
+          control_sha = control_doc['commit']['sha']
+
+          protected_payload = {'message': 'Attempt synthetic protected-branch write', 'content': base64.b64encode(marker).decode(), 'branch': 'main'}
+          protected, _ = api('protected_content_write', 'PUT', '/contents/probe-protected.txt', protected_payload)
+          direct_ref, _ = api('protected_direct_ref_update', 'PATCH', '/git/refs/heads/main', {'sha': control_sha, 'force': False})
+          main_after, after_doc = api('main_ref_after', 'GET', '/git/ref/heads/main')
+          print('RULESET_PROBE_COMPARE ' + json.dumps({
+              'control_unprotected_write_succeeded': control['status'] == 201,
+              'protected_contents_write_succeeded': protected['status'] in (200, 201),
+              'protected_ref_update_succeeded': direct_ref['status'] == 200,
+              'main_sha_unchanged': main_after['status'] == 200 and after_doc['object']['sha'] == main_sha,
+          }, sort_keys=True))
+          PY
